@@ -1,0 +1,23 @@
+# Keycloak, e.g. image quay.io/keycloak/keycloak:26.4.0 running as container
+# "keycloak", with its Postgres database in container "keycloak-db"
+# (image postgres:17).
+#
+# Keycloak migrates its database schema on startup; an older Keycloak can't run
+# on a schema a newer one migrated.
+runtime = "docker"
+
+[[check]]
+name        = "Keycloak"
+container   = "keycloak"
+version_cmd = ["/opt/keycloak/bin/kc.sh", "--version"]
+# kc.sh also prints JVM and OS versions; take the Keycloak line.
+version_regex = 'Keycloak (\d+\.\d+\.\d+)'
+pinned      = "26.4.0"
+rule        = "not_newer"
+
+[[check]]
+name        = "Keycloak database (Postgres)"
+container   = "keycloak-db"
+version_cmd = ["psql", "-U", "postgres", "-tAc", "show server_version"]
+pinned      = "17"
+rule        = "same_major"

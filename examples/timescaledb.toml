@@ -1,0 +1,27 @@
+# TimescaleDB on Postgres, e.g. image timescale/timescaledb:2.30.1-pg17
+# running as container "db".
+#
+# Each database records the TimescaleDB extension version it was last updated
+# to. The new image can only load extension versions whose libraries it ships,
+# so set min/max to the range in the image you're about to deploy:
+#   podman run --rm timescale/timescaledb:2.30.1-pg17 \
+#     sh -c 'ls /usr/local/lib/postgresql/timescaledb-*.so'
+runtime = "docker"
+
+[[check]]
+name        = "Postgres"
+container   = "db"
+version_cmd = ["psql", "-U", "postgres", "-tAc", "show server_version"]
+pinned      = "17"
+rule        = "same_major"
+
+[[check]]
+name        = "TimescaleDB extension ({item})"
+container   = "db"
+# Every database that accepts connections. Databases without the extension
+# print nothing and are skipped.
+for_each    = ["psql", "-U", "postgres", "-tAc", "select datname from pg_database where not datistemplate and datallowconn"]
+version_cmd = ["psql", "-U", "postgres", "-d", "{item}", "-tAc", "select extversion from pg_extension where extname='timescaledb'"]
+rule        = "within"
+min         = "2.17.0"
+max         = "2.30.1"

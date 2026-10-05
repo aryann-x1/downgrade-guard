@@ -1,0 +1,14 @@
+# OpenObserve, e.g. image public.ecr.aws/zinclabs/openobserve:v0.92.2
+# running as container "openobserve".
+#
+# OpenObserve migrates its metadata schema on startup and refuses to start on
+# data migrated by a newer version, so the running version must not be newer
+# than the one you deploy.
+runtime = "docker"
+
+[[check]]
+name        = "OpenObserve"
+container   = "openobserve"
+version_cmd = ["/openobserve", "--version"]
+pinned      = "0.92.2"
+rule        = "not_newer"

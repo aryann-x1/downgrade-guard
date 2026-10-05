@@ -1,0 +1,13 @@
+# Plain Postgres, e.g. image postgres:17 running as container "db".
+#
+# A data directory only works with the major version that created it
+# (moving between majors needs pg_upgrade or dump/restore). Minor versions
+# within a major are interchangeable, so compare majors only.
+runtime = "docker"
+
+[[check]]
+name        = "Postgres"
+container   = "db"
+version_cmd = ["psql", "-U", "postgres", "-tAc", "show server_version"]
+pinned      = "17"
+rule        = "same_major"
