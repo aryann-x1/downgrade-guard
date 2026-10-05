@@ -5,7 +5,7 @@
 # to. The new image can only load extension versions whose libraries it ships,
 # so set min/max to the range in the image you're about to deploy:
 #   podman run --rm timescale/timescaledb:2.30.1-pg17 \
-#     sh -c 'ls /usr/local/lib/postgresql/timescaledb-*.so'
+#     sh -c 'ls /usr/local/lib/postgresql | grep -E "^timescaledb-[0-9]"'
 runtime = "docker"
 
 [[check]]

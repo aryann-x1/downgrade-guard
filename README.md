@@ -206,8 +206,10 @@ Check the range an image ships with:
 
 ```sh
 docker run --rm timescale/timescaledb:2.30.1-pg17 \
-  sh -c 'ls /usr/local/lib/postgresql/timescaledb-*.so'
+  sh -c 'ls /usr/local/lib/postgresql | grep -E "^timescaledb-[0-9]"'
 ```
+
+The first and last versions listed are your `min` and `max`.
 
 Use `for_each` to check every database. Different databases can be on different extension
 versions.
