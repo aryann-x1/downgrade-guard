@@ -1,7 +1,9 @@
 import contextlib
 import io
+import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import tomllib
@@ -258,6 +260,14 @@ class ValidateConfigTest(unittest.TestCase):
             with self.subTest(path=path.name):
                 dg.load_config(path)
 
+    def test_readme_examples_are_valid(self):
+        readme = (ROOT / "README.md").read_text()
+        blocks = re.findall(r"```toml\n(.*?)```", readme, re.DOTALL)
+        self.assertGreaterEqual(len(blocks), 3)
+        for block in blocks:
+            with self.subTest(block=block[:40]):
+                self.assertEqual(dg.validate_config(tomllib.loads(block)), [])
+
     def test_unknown_rule(self):
         self.assertError(self.errors(rule="newest"), "'rule' must be one of")
 
@@ -504,38 +514,40 @@ class ExitCodeTest(unittest.TestCase):
                          "Redis      -        8.4.0  CHECK container not running")
 
 
-class MainTest(unittest.TestCase):
-    def run_main(self, config_text, execs, containers=None):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "downgrade-guard.toml")
-            with open(path, "w") as f:
-                f.write(config_text)
-            out, err = io.StringIO(), io.StringIO()
-            with mock.patch.object(dg, "run", fake_run(execs, containers)), \
-                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = dg.main(["check", "-c", path])
-        return code, out.getvalue(), err.getvalue()
+def run_main(config_text, execs, containers=None, extra_args=()):
+    """Run main() on a temporary config with mocked containers -> (exit code, stdout, stderr)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "downgrade-guard.toml")
+        with open(path, "w") as f:
+            f.write(config_text)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(dg, "run", fake_run(execs, containers)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = dg.main(["check", "-c", path, *extra_args])
+    return code, out.getvalue(), err.getvalue()
 
+
+class MainTest(unittest.TestCase):
     def test_stop(self):
-        code, out, _ = self.run_main(SPEC_CONFIG, SPEC_OUTPUTS)
+        code, out, _ = run_main(SPEC_CONFIG, SPEC_OUTPUTS)
         self.assertEqual(code, 1)
         self.assertIn("OpenObserve", out)
         self.assertIn("Deploy blocked", out)
 
     def test_ok(self):
         outputs = {**SPEC_OUTPUTS, ("openobserve", "/openobserve", "--version"): (0, "v0.92.2")}
-        code, out, _ = self.run_main(SPEC_CONFIG, outputs)
+        code, out, _ = run_main(SPEC_CONFIG, outputs)
         self.assertEqual(code, 0)
         self.assertIn("All checks passed.", out)
 
     def test_unable_to_check(self):
         outputs = {**SPEC_OUTPUTS, ("openobserve", "/openobserve", "--version"): (0, "v0.92.2")}
-        code, out, _ = self.run_main(SPEC_CONFIG, outputs, {"redis": "false"})
+        code, out, _ = run_main(SPEC_CONFIG, outputs, {"redis": "false"})
         self.assertEqual(code, 2)
         self.assertIn("couldn't be checked", out)
 
     def test_bad_config(self):
-        code, out, err = self.run_main('[[check]]\nname = "A"\nrule = "newest"\n', {})
+        code, out, err = run_main('[[check]]\nname = "A"\nrule = "newest"\n', {})
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
         self.assertIn("'rule' must be one of", err)
@@ -567,6 +579,341 @@ class RunTest(unittest.TestCase):
         code, out = dg.run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2)
         self.assertEqual(code, 124)
         self.assertIn("timed out", out)
+
+
+
+class JsonOutputTest(unittest.TestCase):
+    def test_format_json(self):
+        rows = [dg.Row("OpenObserve", "1.0.3", "0.92.2", "STOP",
+                       "newer than pin; deploying would downgrade it"),
+                dg.Row("Redis", "-", "-", "CHECK", "container not running")]
+        report = json.loads(dg.format_json(rows, 1))
+        self.assertEqual(report, {
+            "tool_version": dg.__version__,
+            "exit_code": 1,
+            "results": [
+                {"component": "OpenObserve", "running": "1.0.3", "pin": "0.92.2",
+                 "result": "STOP", "reason": "newer than pin; deploying would downgrade it"},
+                {"component": "Redis", "running": None, "pin": None,
+                 "result": "CHECK", "reason": "container not running"},
+            ],
+        })
+
+    def test_main_json(self):
+        code, out, _ = run_main(SPEC_CONFIG, SPEC_OUTPUTS, extra_args=["--json"])
+        report = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual([r["result"] for r in report["results"]], ["STOP", "OK", "OK", "info"])
+        self.assertEqual(report["results"][2]["component"], "TimescaleDB extension (app)")
+        self.assertNotIn("error", report)
+
+    def test_main_json_config_error(self):
+        code, out, err = run_main('[[check]]\nname = "A"\n', {}, extra_args=["--json"])
+        report = json.loads(out)
+        self.assertEqual(code, 2)
+        self.assertEqual(report["exit_code"], 2)
+        self.assertEqual(report["results"], [])
+        self.assertIn("'rule' must be one of", report["error"])
+        self.assertEqual(err, "")
+
+
+class SplitImageTest(unittest.TestCase):
+    def test_split(self):
+        cases = {
+            "redis:8.4.0-alpine": ("redis", "8.4.0-alpine"),
+            "docker.io/library/redis:8.4.0": ("redis", "8.4.0"),
+            "index.docker.io/library/redis:8": ("redis", "8"),
+            "library/redis:8": ("redis", "8"),
+            "Redis:8": ("redis", "8"),
+            "bitnami/redis:7.2": ("bitnami/redis", "7.2"),
+            "quay.io/keycloak/keycloak:26.4.0": ("quay.io/keycloak/keycloak", "26.4.0"),
+            "localhost:5000/team/db:17.2": ("localhost:5000/team/db", "17.2"),
+            "localhost:5000/team/db": ("localhost:5000/team/db", ""),
+            "redis": ("redis", ""),
+            "redis:8.4.0@sha256:abc123": ("redis", "8.4.0"),
+            "redis@sha256:abc123": ("redis", ""),
+        }
+        for ref, expected in cases.items():
+            with self.subTest(ref=ref):
+                self.assertEqual(dg.split_image(ref), expected)
+
+
+class PinFromFileTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = pathlib.Path(tmp.name)
+
+    def write(self, name, text):
+        path = self.dir / name
+        path.write_text(text)
+        return path
+
+    def pin(self, name, text, image, tag_regex=None, environ=None):
+        return dg.pin_from_file(self.write(name, text), image, tag_regex, environ or {})
+
+    def assertPinError(self, fragment, *args, **kwargs):
+        with self.assertRaises(ValueError) as ctx:
+            self.pin(*args, **kwargs)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_dockerfile(self):
+        dockerfile = "FROM node:22 AS build\nRUN make\nFROM docker.io/library/redis:8.4.0-alpine\n"
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "redis"), "8.4.0-alpine")
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "node"), "22")
+
+    def test_dockerfile_flags_and_case(self):
+        dockerfile = "from --platform=linux/amd64 postgres:17.2 as db\n"
+        self.assertEqual(self.pin("Containerfile", dockerfile, "postgres"), "17.2")
+
+    def test_dockerfile_build_args(self):
+        dockerfile = ('ARG PG_MAJOR=17\nARG TS="2.30.1"\n'
+                      "FROM timescale/timescaledb:${TS}-pg${PG_MAJOR}\n")
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "timescale/timescaledb"),
+                         "2.30.1-pg17")
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "timescale/timescaledb",
+                                  tag_regex=r"pg(\d+)"), "17")
+
+    def test_dockerfile_ignores_environment(self):
+        dockerfile = "ARG REDIS_VERSION=8.4.0\nFROM redis:$REDIS_VERSION\n"
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "redis",
+                                  environ={"REDIS_VERSION": "9.9.9"}), "8.4.0")
+
+    def test_compose(self):
+        compose = """
+services:
+  db:
+    image: "postgres:17.2"
+  cache:
+    image: 'redis:8.4.0-alpine'  # keep in sync
+  auth:
+    image: quay.io/keycloak/keycloak:26.4.0
+"""
+        self.assertEqual(self.pin("compose.yaml", compose, "postgres"), "17.2")
+        self.assertEqual(self.pin("compose.yaml", compose, "redis"), "8.4.0-alpine")
+        self.assertEqual(self.pin("compose.yaml", compose, "quay.io/keycloak/keycloak"), "26.4.0")
+        self.assertPinError("not found", "compose.yaml", compose, "keycloak")
+
+    def test_kubernetes_manifest(self):
+        manifest = "spec:\n  containers:\n    - image: redis:8.4.0\n      name: redis\n"
+        self.assertEqual(self.pin("deploy.yml", manifest, "redis"), "8.4.0")
+
+    def test_compose_variables(self):
+        compose = ("services:\n  a:\n    image: redis:${REDIS_TAG:-8.4.0}\n"
+                   "  b:\n    image: postgres:${PG_TAG}\n")
+        self.assertEqual(self.pin("compose.yaml", compose, "redis"), "8.4.0")
+        self.assertEqual(self.pin("compose.yaml", compose, "redis",
+                                  environ={"REDIS_TAG": "8.2.1"}), "8.2.1")
+        self.assertEqual(self.pin("compose.yaml", compose, "postgres",
+                                  environ={"PG_TAG": "17"}), "17")
+        self.assertPinError("can't resolve $PG_TAG", "compose.yaml", compose, "postgres")
+
+    def test_compose_dotenv(self):
+        self.write(".env", "# versions\nexport PG_TAG='17.2'\nOTHER=x\n")
+        compose = "services:\n  db:\n    image: postgres:${PG_TAG}\n"
+        self.assertEqual(self.pin("compose.yaml", compose, "postgres"), "17.2")
+        # the environment wins over .env, like docker compose
+        self.assertEqual(self.pin("compose.yaml", compose, "postgres",
+                                  environ={"PG_TAG": "16.4"}), "16.4")
+
+    def test_unresolved_variable_in_name_is_a_hint(self):
+        compose = "services:\n  db:\n    image: ${REGISTRY}/postgres:17\n"
+        self.assertPinError("can't resolve $REGISTRY", "compose.yaml", compose, "postgres")
+
+    def test_same_tag_twice_is_fine(self):
+        compose = "services:\n  a:\n    image: redis:8.4.0\n  b:\n    image: redis:8.4.0\n"
+        self.assertEqual(self.pin("compose.yaml", compose, "redis"), "8.4.0")
+
+    def test_errors(self):
+        self.assertPinError("different tags in", "compose.yaml",
+                            "x:\n  image: redis:8.4.0\ny:\n  image: redis:8.2.0\n", "redis")
+        self.assertPinError("has no tag", "compose.yaml", "x:\n  image: redis\n", "redis")
+        self.assertPinError("has no tag", "Dockerfile", "FROM redis@sha256:abc\n", "redis")
+        self.assertPinError("isn't a version", "compose.yaml", "x:\n  image: redis:latest\n",
+                            "redis")
+        self.assertPinError("isn't a version", "compose.yaml", "x:\n  image: redis:alpine\n",
+                            "redis")
+        self.assertPinError("tag_regex didn't match", "compose.yaml",
+                            "x:\n  image: redis:8.4.0\n", "redis", tag_regex=r"pg(\d+)")
+        self.assertPinError("not found", "Dockerfile", "FROM postgres:17\n", "redis")
+        with self.assertRaisesRegex(ValueError, "can't read"):
+            dg.pin_from_file(self.dir / "missing.yaml", "redis")
+
+    def test_load_config_resolves_relative_to_config(self):
+        (self.dir / "deploy").mkdir()
+        self.write("deploy/compose.yaml", "services:\n  r:\n    image: redis:8.2.0-alpine\n")
+        config = self.write("deploy/downgrade-guard.toml", """
+[[check]]
+name        = "Redis"
+container   = "redis"
+version_cmd = ["redis-server", "--version"]
+rule        = "not_newer"
+pinned_from = { file = "compose.yaml", image = "redis" }
+""")
+        loaded = dg.load_config(config)
+        self.assertEqual(loaded["check"][0]["pinned"], "8.2.0-alpine")
+        runner = fake_run({("redis", "redis-server", "--version"): (0, "Redis server v=8.4.0")})
+        with mock.patch.object(dg, "run", runner):
+            rows = dg.check_all(loaded)
+        self.assertEqual(rows, [dg.Row("Redis", "8.4.0", "8.2.0-alpine", "STOP",
+                                       "newer than pin; deploying would downgrade it")])
+
+    def test_load_config_reports_pin_errors(self):
+        config = self.write("downgrade-guard.toml", """
+[[check]]
+name        = "Redis"
+container   = "redis"
+version_cmd = ["redis-server", "--version"]
+rule        = "not_newer"
+pinned_from = { file = "nope.yaml", image = "redis" }
+""")
+        with self.assertRaisesRegex(dg.ConfigError, r"check #1 \(Redis\): pinned_from: can't read"):
+            dg.load_config(config)
+
+
+class PinnedFromValidationTest(unittest.TestCase):
+    def errors(self, **fields):
+        return dg.validate_config({"check": [check(**fields)]})
+
+    def test_valid(self):
+        spec = {"file": "compose.yaml", "image": "redis"}
+        for rule in ("not_newer", "same_major", "same_minor", "info"):
+            with self.subTest(rule=rule):
+                self.assertEqual(self.errors(rule=rule, pinned_from=spec), [])
+        self.assertEqual(self.errors(rule="same_major", pinned_from={**spec, "tag_regex": r"pg(\d+)"}),
+                         [])
+
+    def test_invalid(self):
+        spec = {"file": "compose.yaml", "image": "redis"}
+        cases = [
+            ({"rule": "not_newer", "pinned_from": "compose.yaml"}, "must be a table"),
+            ({"rule": "not_newer", "pinned_from": {"file": "compose.yaml"}},
+             "'pinned_from.image' must be"),
+            ({"rule": "not_newer", "pinned_from": {**spec, "tag": "x"}},
+             "unknown field 'pinned_from.tag'"),
+            ({"rule": "not_newer", "pinned": "1.0", "pinned_from": spec}, "not both"),
+            ({"rule": "within", "min": "1", "max": "2", "pinned_from": spec}, "doesn't apply"),
+            ({"rule": "not_newer", "pinned_from": {**spec, "tag_regex": "pg"}}, "capture group"),
+            ({"rule": "not_newer"}, "needs 'pinned' (or 'pinned_from')"),
+        ]
+        for fields, fragment in cases:
+            with self.subTest(fields=fields):
+                errors = self.errors(**fields)
+                self.assertTrue(any(fragment in e for e in errors), f"{fragment!r} not in {errors}")
+
+
+def fake_kubectl(execs, gets=None):
+    """A stand-in for dg.run with runtime = "kubectl".
+
+    execs: {(target, *cmd): (exit code, output)}, cmd without "--".
+    gets:  {target: (exit code, output)} for `kubectl get`; default is a running pod.
+    """
+    gets = gets or {}
+    calls = []
+
+    def run(args, timeout=None):
+        calls.append(list(args))
+        assert args[0] == "kubectl", args
+        if "get" in args:
+            target = args[args.index("get") + 1]
+            return gets.get(target, (0, "Running"))
+        assert "exec" in args, f"unexpected command {args}"
+        target = args[args.index("exec") + 1]
+        cmd = args[args.index("--") + 1:]
+        return execs.get((target, *cmd), (1, "error: command not found\n"))
+
+    run.calls = calls
+    return run
+
+
+class KubectlTest(unittest.TestCase):
+    CONFIG = {"runtime": "kubectl", "namespace": "data", "context": "prod", "check": [
+        check(name="Postgres", container="statefulset/db", pod_container="postgres",
+              version_cmd=["psql", "-tAc", "show server_version"], rule="same_major", pinned="17"),
+        check(name="Redis", container="redis-0", version_cmd=["redis-server", "--version"],
+              rule="not_newer", pinned="8.4.0"),
+    ]}
+
+    def rows(self, execs, gets=None, config=None):
+        runner = fake_kubectl(execs, gets)
+        with mock.patch.object(dg, "run", runner):
+            return dg.check_all(config or self.CONFIG), runner.calls
+
+    def test_exec_and_get_commands(self):
+        rows, calls = self.rows({
+            ("statefulset/db", "psql", "-tAc", "show server_version"): (0, "17.11\n"),
+            ("redis-0", "redis-server", "--version"): (0, "Redis server v=8.4.0\n"),
+        })
+        self.assertEqual([r.result for r in rows], ["OK", "OK"])
+        self.assertEqual(calls, [
+            ["kubectl", "--context", "prod", "--namespace", "data", "get", "statefulset/db",
+             "-o", "jsonpath={.status.phase}"],
+            ["kubectl", "--context", "prod", "--namespace", "data", "exec", "statefulset/db",
+             "-c", "postgres", "--", "psql", "-tAc", "show server_version"],
+            ["kubectl", "--context", "prod", "--namespace", "data", "get", "pod/redis-0",
+             "-o", "jsonpath={.status.phase}"],
+            ["kubectl", "--context", "prod", "--namespace", "data", "exec", "redis-0",
+             "--", "redis-server", "--version"],
+        ])
+
+    def test_without_namespace_or_context(self):
+        config = {"runtime": "kubectl", "check": [check(rule="info")]}
+        _, calls = self.rows({("c", "thing", "--version"): (0, "1.2\n")}, config=config)
+        self.assertEqual(calls[1], ["kubectl", "exec", "c", "--", "thing", "--version"])
+
+    def test_not_found_and_not_running(self):
+        rows, calls = self.rows({}, gets={
+            "statefulset/db": (1, 'Error from server (NotFound): statefulsets.apps "db" not found\n'),
+            "pod/redis-0": (0, "Pending"),
+        })
+        self.assertEqual([(r.result, r.reason) for r in rows], [
+            ("CHECK", "statefulset/db not found"),
+            ("CHECK", "pod not running (Pending)"),
+        ])
+        self.assertFalse(any("exec" in args for args in calls))
+
+    def test_get_failure(self):
+        rows, _ = self.rows({}, gets={"statefulset/db": (1, "error: You must be logged in\n"),
+                                      "pod/redis-0": (1, "error: You must be logged in\n")})
+        self.assertEqual(rows[0].reason, "kubectl get failed: error: You must be logged in")
+
+    def test_kubectl_log_lines_are_dropped(self):
+        klog = ('E1005 22:47:25.143104 1281526 memcache.go:381] "Couldn\'t get current server '
+                'API group list" err="dial tcp 127.0.0.1:1: connect: connection refused"\n')
+        refused = "The connection to the server 127.0.0.1:1 was refused\n"
+        rows, _ = self.rows({}, gets={"statefulset/db": (1, klog * 3 + refused),
+                                      "pod/redis-0": (0, "Running")})
+        self.assertEqual(rows[0].reason,
+                         "kubectl get failed: The connection to the server 127.0.0.1:1 was refused")
+        rows, _ = self.rows({("redis-0", "redis-server", "--version"):
+                             (0, "W1005 10:00:00.000001 7 warnings.go:70] v1.2.3 is deprecated\n"
+                                 "Redis server v=8.4.0\n")}, gets={"statefulset/db": (1, refused)})
+        self.assertEqual(rows[1], dg.Row("Redis", "8.4.0", "8.4.0", "OK"))
+
+    def test_defaulted_container_notice_is_dropped(self):
+        notice = 'Defaulted container "app" out of: app, sidecar-1.2.3\n'
+        config = {"runtime": "kubectl", "check": [check(
+            name="DB ({item})", container="db-0", rule="info", for_each=["list"],
+            version_cmd=["show", "{item}"])]}
+        rows, _ = self.rows({
+            ("db-0", "list"): (0, notice + "app\n"),
+            ("db-0", "show", "app"): (0, notice + "2.28.2\n"),
+        }, config=config)
+        self.assertEqual(rows, [dg.Row("DB (app)", "2.28.2", "-", "info")])
+
+    def test_validation(self):
+        docker_with_kube_fields = {"runtime": "docker", "namespace": "x",
+                                   "check": [check(rule="info", pod_container="y")]}
+        errors = dg.validate_config(docker_with_kube_fields)
+        self.assertTrue(any("'namespace' only applies" in e for e in errors), errors)
+        self.assertTrue(any("'pod_container' only applies" in e for e in errors), errors)
+        self.assertEqual(dg.validate_config(self.CONFIG), [])
+        bad = {"runtime": "kubectl", "context": "", "check": [check(rule="info")]}
+        self.assertTrue(any("'context' must be" in e for e in dg.validate_config(bad)))
+
+    def test_example_is_valid(self):
+        dg.load_config(ROOT / "examples" / "kubernetes.toml")
 
 
 if __name__ == "__main__":
