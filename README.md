@@ -50,11 +50,11 @@ Requirements: Python 3.11+, plus `docker` or `podman` on the machine where the c
 
 ```sh
 # 1. Download the single file
-curl -fsSLO https://raw.githubusercontent.com/OWNER/downgrade-guard/main/downgrade_guard.py
+curl -fsSLO https://raw.githubusercontent.com/aryann-x1/downgrade-guard/main/downgrade_guard.py
 
 # 2. Copy an example config and edit the container names and pins
 curl -fsSL -o downgrade-guard.toml \
-  https://raw.githubusercontent.com/OWNER/downgrade-guard/main/examples/postgres.toml
+  https://raw.githubusercontent.com/aryann-x1/downgrade-guard/main/examples/postgres.toml
 
 # 3. Run it
 python3 downgrade_guard.py check            # reads ./downgrade-guard.toml
