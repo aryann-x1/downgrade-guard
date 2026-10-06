@@ -73,8 +73,10 @@ def compare_versions(a, b):
 
 def extract_version(output, regex=None):
     """Find the version in a command's output: first capture group of `regex`, or None."""
-    m = re.search(regex or DEFAULT_VERSION_REGEX, output)
-    return m.group(1).strip() if m else None
+    for m in re.finditer(regex or DEFAULT_VERSION_REGEX, output):
+        if m.group(1):  # an optional group can match nothing
+            return m.group(1).strip()
+    return None
 
 
 # --- Rules --------------------------------------------------------------------
