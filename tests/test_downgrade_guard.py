@@ -736,7 +736,7 @@ services:
         self.assertEqual(self.pin("compose.yaml", compose, "redis"), "8.4.0")
 
     def test_errors(self):
-        self.assertPinError("different tags in", "compose.yaml",
+        self.assertPinError("different tags: 8.4.0 (", "compose.yaml",
                             "x:\n  image: redis:8.4.0\ny:\n  image: redis:8.2.0\n", "redis")
         self.assertPinError("has no tag", "compose.yaml", "x:\n  image: redis\n", "redis")
         self.assertPinError("has no tag", "Dockerfile", "FROM redis@sha256:abc\n", "redis")
@@ -749,6 +749,93 @@ services:
         self.assertPinError("not found", "Dockerfile", "FROM postgres:17\n", "redis")
         with self.assertRaisesRegex(ValueError, "can't read"):
             dg.pin_from_file(self.dir / "missing.yaml", "redis")
+
+    def test_dockerfile_only_global_args_reach_from(self):
+        # Docker expands FROM with ARGs declared before the first FROM only.
+        dockerfile = ("ARG VERSION=8.4.0\nFROM node:22 AS assets\nARG VERSION=9.1.0\n"
+                      "FROM redis:${VERSION}\n")
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "redis"), "8.4.0")
+
+    def test_dockerfile_arg_without_default(self):
+        self.assertPinError("can't resolve $VERSION", "Dockerfile",
+                            "ARG VERSION\nFROM redis:${VERSION}\n", "redis")
+
+    def test_dockerfile_build_stages_are_skipped(self):
+        dockerfile = "FROM redis:8.4.0 AS redis\nRUN true\nFROM REDIS\nFROM redis AS final\n"
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "redis"), "8.4.0")
+
+    def test_unresolved_variable_that_could_be_the_image(self):
+        compose = ("services:\n  cache:\n    image: ${CACHE_IMAGE}\n"
+                   "  other:\n    image: redis:8.4.0\n")
+        self.assertPinError("so it could be 'redis'", "compose.yaml", compose, "redis")
+        self.assertEqual(self.pin("compose.yaml", compose, "redis",
+                                  environ={"CACHE_IMAGE": "postgres:17"}), "8.4.0")
+
+    def test_unresolved_variable_in_another_images_tag_is_ignored(self):
+        compose = ("services:\n  db:\n    image: postgres:${PG_TAG}\n"
+                   "  cache:\n    image: redis:8.4.0\n")
+        self.assertEqual(self.pin("compose.yaml", compose, "redis"), "8.4.0")
+
+    def test_variable_forms(self):
+        cases = [
+            ("redis:${T:-8.4.0}", {}, "8.4.0"),
+            ("redis:${T:-8.4.0}", {"T": ""}, "8.4.0"),          # :- treats empty as unset
+            ("redis:${T-8.4.0}", {"T": "8.2.0"}, "8.2.0"),
+            ("redis:8.4${P:+.1}", {"P": "x"}, "8.4.1"),
+            ("redis:8.4${P:+.1}", {}, "8.4"),
+            ("redis:8.4${P:+.1}", {"P": ""}, "8.4"),
+            ("redis:8.4${P+.1}", {"P": ""}, "8.4.1"),           # + only needs it set
+            ("redis:${T:?set T}", {"T": "8.2.0"}, "8.2.0"),
+            ("redis:$T", {"T": "8.2.0"}, "8.2.0"),
+        ]
+        for written, environ, expected in cases:
+            with self.subTest(written=written, environ=environ):
+                compose = f"services:\n  r:\n    image: {written}\n"
+                self.assertEqual(self.pin("compose.yaml", compose, "redis", environ=environ),
+                                 expected)
+
+    def test_unresolved_variable_forms(self):
+        for written, environ in [("redis:${T}", {}), ("redis:${T:?set T}", {"T": ""}),
+                                 ("redis:${T?set T}", {})]:
+            with self.subTest(written=written, environ=environ):
+                self.assertPinError("can't resolve $T", "compose.yaml",
+                                    f"services:\n  r:\n    image: {written}\n", "redis",
+                                    environ=environ)
+
+    def test_set_but_empty_variable_is_used(self):
+        # ${T-x} keeps an empty T, so the tag is empty, which is an error
+        self.assertPinError("has no tag", "compose.yaml",
+                            "services:\n  r:\n    image: redis${T-:8.4.0}\n", "redis",
+                            environ={"T": ""})
+
+    def test_dollar_escape(self):
+        compose = "services:\n  r:\n    image: redis:$${T}\n"
+        self.assertPinError("isn't a version", "compose.yaml", compose, "redis")
+
+    def test_dotenv_quotes_and_comments(self):
+        self.write(".env", 'A="8.4.0" # pinned\nB=8.2.0 # next: 8.4\nC=\'7.2.1\'\nD=6.0#x\n')
+        for var, expected in {"A": "8.4.0", "B": "8.2.0", "C": "7.2.1", "D": "6.0#x"}.items():
+            with self.subTest(var=var):
+                compose = f"services:\n  r:\n    image: redis:${{{var}}}\n"
+                self.assertEqual(self.pin("compose.yaml", compose, "redis"), expected)
+
+    def test_compose_override_is_read(self):
+        compose = "services:\n  r:\n    image: redis:8.4.0\n"
+        self.write("compose.override.yaml", "services:\n  r:\n    image: redis:7.2.0\n")
+        self.assertPinError("compose.override.yaml:3", "compose.yaml", compose, "redis")
+        self.write("compose.override.yaml", "services:\n  r:\n    image: redis:8.4.0\n")
+        self.assertEqual(self.pin("compose.yaml", compose, "redis"), "8.4.0")
+
+    def test_override_only_for_default_compose_names(self):
+        self.write("compose.override.yaml", "services:\n  r:\n    image: redis:7.2.0\n")
+        compose = "services:\n  r:\n    image: redis:8.4.0\n"
+        self.assertEqual(self.pin("prod.yaml", compose, "redis"), "8.4.0")
+        self.assertPinError("different tags", "docker-compose.yml", compose, "redis")
+
+    def test_tag_regex_with_optional_group(self):
+        compose = "services:\n  r:\n    image: redis:8.4.0\n"
+        self.assertPinError("tag_regex didn't match", "compose.yaml", compose, "redis",
+                            tag_regex=r"(pg\d+)?")
 
     def test_load_config_resolves_relative_to_config(self):
         (self.dir / "deploy").mkdir()
@@ -763,11 +850,32 @@ pinned_from = { file = "compose.yaml", image = "redis" }
 """)
         loaded = dg.load_config(config)
         self.assertEqual(loaded["check"][0]["pinned"], "8.2.0-alpine")
+        self.assertEqual(dg.validate_config(loaded), [])  # still a valid config
         runner = fake_run({("redis", "redis-server", "--version"): (0, "Redis server v=8.4.0")})
         with mock.patch.object(dg, "run", runner):
             rows = dg.check_all(loaded)
         self.assertEqual(rows, [dg.Row("Redis", "8.4.0", "8.2.0-alpine", "STOP",
                                        "newer than pin; deploying would downgrade it")])
+
+    def test_load_config_reports_pin_and_validation_errors_together(self):
+        config = self.write("downgrade-guard.toml", """
+[[check]]
+name        = "Redis"
+container   = "redis"
+version_cmd = ["redis-server", "--version"]
+rule        = "not_newer"
+pinned_from = { file = "nope.yaml", image = "redis" }
+
+[[check]]
+name        = "Typo"
+container   = "x"
+version_cmd = ["x"]
+rule        = "newest"
+""")
+        with self.assertRaises(dg.ConfigError) as ctx:
+            dg.load_config(config)
+        self.assertIn("check #1 (Redis): pinned_from: can't read", str(ctx.exception))
+        self.assertIn("check #2 (Typo): 'rule' must be one of", str(ctx.exception))
 
     def test_load_config_reports_pin_errors(self):
         config = self.write("downgrade-guard.toml", """
@@ -829,7 +937,7 @@ def fake_kubectl(execs, gets=None):
             target = args[args.index("get") + 1]
             return gets.get(target, (0, "Running"))
         assert "exec" in args, f"unexpected command {args}"
-        target = args[args.index("exec") + 1]
+        target = next(a for a in args[args.index("exec") + 1:] if not a.startswith("-"))
         cmd = args[args.index("--") + 1:]
         return execs.get((target, *cmd), (1, "error: command not found\n"))
 
@@ -859,18 +967,18 @@ class KubectlTest(unittest.TestCase):
         self.assertEqual(calls, [
             ["kubectl", "--context", "prod", "--namespace", "data", "get", "statefulset/db",
              "-o", "jsonpath={.status.phase}"],
-            ["kubectl", "--context", "prod", "--namespace", "data", "exec", "statefulset/db",
-             "-c", "postgres", "--", "psql", "-tAc", "show server_version"],
+            ["kubectl", "--context", "prod", "--namespace", "data", "exec", "--quiet",
+             "statefulset/db", "-c", "postgres", "--", "psql", "-tAc", "show server_version"],
             ["kubectl", "--context", "prod", "--namespace", "data", "get", "pod/redis-0",
              "-o", "jsonpath={.status.phase}"],
-            ["kubectl", "--context", "prod", "--namespace", "data", "exec", "redis-0",
-             "--", "redis-server", "--version"],
+            ["kubectl", "--context", "prod", "--namespace", "data", "exec", "--quiet",
+             "redis-0", "--", "redis-server", "--version"],
         ])
 
     def test_without_namespace_or_context(self):
         config = {"runtime": "kubectl", "check": [check(rule="info")]}
         _, calls = self.rows({("c", "thing", "--version"): (0, "1.2\n")}, config=config)
-        self.assertEqual(calls[1], ["kubectl", "exec", "c", "--", "thing", "--version"])
+        self.assertEqual(calls[1], ["kubectl", "exec", "--quiet", "c", "--", "thing", "--version"])
 
     def test_not_found_and_not_running(self):
         rows, calls = self.rows({}, gets={
@@ -878,10 +986,15 @@ class KubectlTest(unittest.TestCase):
             "pod/redis-0": (0, "Pending"),
         })
         self.assertEqual([(r.result, r.reason) for r in rows], [
-            ("CHECK", "statefulset/db not found"),
+            ("CHECK", 'statefulsets.apps "db" not found'),
             ("CHECK", "pod not running (Pending)"),
         ])
         self.assertFalse(any("exec" in args for args in calls))
+
+    def test_missing_namespace_is_named(self):
+        error = 'Error from server (NotFound): namespaces "dat" not found\n'
+        rows, _ = self.rows({}, gets={"statefulset/db": (1, error), "pod/redis-0": (1, error)})
+        self.assertEqual({r.reason for r in rows}, {'namespaces "dat" not found'})
 
     def test_get_failure(self):
         rows, _ = self.rows({}, gets={"statefulset/db": (1, "error: You must be logged in\n"),
@@ -901,14 +1014,23 @@ class KubectlTest(unittest.TestCase):
                                  "Redis server v=8.4.0\n")}, gets={"statefulset/db": (1, refused)})
         self.assertEqual(rows[1], dg.Row("Redis", "8.4.0", "8.4.0", "OK"))
 
-    def test_defaulted_container_notice_is_dropped(self):
-        notice = 'Defaulted container "app" out of: app, sidecar-1.2.3\n'
+    def test_server_warnings_are_dropped(self):
+        warning = "Warning: policy/v1beta1 PodSecurityPolicy is deprecated in v1.21+\n"
+        rows, _ = self.rows({
+            ("statefulset/db", "psql", "-tAc", "show server_version"):
+                (0, warning + "17.11\n"),
+            ("redis-0", "redis-server", "--version"): (0, "Redis server v=8.4.0\n"),
+        }, gets={"statefulset/db": (0, ""), "pod/redis-0": (0, warning + "Running")})
+        self.assertEqual(rows, [dg.Row("Postgres", "17.11", "17", "OK"),
+                                dg.Row("Redis", "8.4.0", "8.4.0", "OK")])
+
+    def test_for_each_items_come_only_from_the_command(self):
         config = {"runtime": "kubectl", "check": [check(
             name="DB ({item})", container="db-0", rule="info", for_each=["list"],
             version_cmd=["show", "{item}"])]}
         rows, _ = self.rows({
-            ("db-0", "list"): (0, notice + "app\n"),
-            ("db-0", "show", "app"): (0, notice + "2.28.2\n"),
+            ("db-0", "list"): (0, "Warning: something is deprecated in v1.2+\napp\n"),
+            ("db-0", "show", "app"): (0, "2.28.2\n"),
         }, config=config)
         self.assertEqual(rows, [dg.Row("DB (app)", "2.28.2", "-", "info")])
 

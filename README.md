@@ -152,16 +152,34 @@ pinned_from = { file = "Dockerfile", image = "timescale/timescaledb", tag_regex 
 
 How files are read:
 
-- **Dockerfiles** (any file not ending in `.yaml`/`.yml`): `FROM` lines. `${VAR}` and `$VAR` come
-  from `ARG VAR=default` lines in the same file. The environment isn't used, because
-  `docker build` doesn't use it either.
-- **Compose files and Kubernetes manifests** (`.yaml`/`.yml`): `image:` lines. `${VAR}` comes from
-  the environment, then from a `.env` file next to the compose file, as `docker compose` does.
-- `${VAR:-default}` works in both.
+- **Dockerfiles** (any file not ending in `.yaml`/`.yml`): `FROM` lines. A `FROM` that names an
+  earlier build stage (`FROM base`) is skipped. Variables come from `ARG VAR=default` lines
+  *before the first `FROM`*: those are the only ones Docker lets a `FROM` use. The environment
+  isn't used, because `docker build` doesn't use it either.
+- **Compose files and Kubernetes manifests** (`.yaml`/`.yml`): `image:` lines. Variables come from
+  the environment, then from a `.env` file next to the compose file, with compose's quoting and
+  `# comment` rules.
+- **Compose override files:** if `file` is a default compose name (`compose.yaml`,
+  `compose.yml`, `docker-compose.yaml` or `docker-compose.yml`), any
+  `compose.override.yaml`-style file next to it is read too, because `docker compose` merges it
+  automatically.
+- **Variable syntax:** the compose forms all work: `$VAR`, `${VAR}`, `${VAR:-default}`,
+  `${VAR-default}`, `${VAR:?error}`, `${VAR:+alt}`, `${VAR+alt}` and `$$` for a literal `$`.
 
-The config is rejected (exit 2) if the image isn't in the file, appears with different tags, has
-no tag, has a tag that isn't a version (`latest`, `alpine`), or uses a variable that can't be
-resolved. `pinned_from` works with every rule except `within`.
+It fails closed. The config is rejected (exit 2) if any of these is true:
+
+- the image isn't in the file;
+- the image appears with different tags, including between a compose file and its override;
+- the image has no tag, or a tag that isn't a version (`latest`, `alpine`);
+- a variable can't be resolved on a line that is, or *might be*, this image (`image: ${IMAGE}`).
+
+A variable that can't be resolved in *another* image's tag is ignored. `pinned_from` works with
+every rule except `within`.
+
+Run the check in the same directory and with the same environment variables as the deploy, so
+variables resolve the same way. Things compose takes from its command line aren't seen:
+`-f a.yaml -f b.yaml`, `COMPOSE_FILE`, `--env-file`. With those, point `file` at the file that
+sets the image, and export the variables before running the check.
 
 ### Kubernetes
 
@@ -182,7 +200,7 @@ pinned        = "17"
 rule          = "same_major"
 ```
 
-`container` is anything `kubectl exec` accepts: a pod name (`db-0`) or `<kind>/<name>`
+Needs kubectl 1.21 or newer. `container` is anything `kubectl exec` accepts: a pod name (`db-0`) or `<kind>/<name>`
 (`statefulset/db`, `deployment/keycloak`). For a kind/name, kubectl picks one of its pods, which
 is fine because they all run the same image. If replicas might be on different versions halfway
 through a rollout, list the pods individually.
@@ -271,17 +289,20 @@ deploy:
   runs-on: ubuntu-latest
   steps:
     - uses: actions/checkout@v7
-    - name: Check for downgrades on the server
-      run: |
-        # compose.yaml goes along because the config reads its pins with pinned_from
-        scp downgrade_guard.py downgrade-guard.toml compose.yaml deploy@$HOST:/tmp/
-        ssh deploy@$HOST 'cd /tmp && python3 downgrade_guard.py check'
+    - name: Upload the new compose file and the guard
+      # Copying files changes nothing that's running; only `docker compose up` does.
+      run: scp compose.yaml downgrade-guard.toml downgrade_guard.py deploy@$HOST:/srv/app/
+    - name: Check for downgrades
+      # Same directory, .env and override files as the deploy below, so pinned_from
+      # reads exactly what docker compose will deploy.
+      run: ssh deploy@$HOST 'cd /srv/app && python3 downgrade_guard.py check'
     - name: Deploy
       run: ssh deploy@$HOST 'cd /srv/app && docker compose pull && docker compose up -d'
 ```
 
 If the check step fails, the deploy step doesn't run. The table in the job log shows which
-component would have been downgraded.
+component would have been downgraded. Don't run the check from a shared directory such as
+`/tmp`: `pinned_from` would read whatever `.env` it finds there.
 
 ## Per-service notes
 

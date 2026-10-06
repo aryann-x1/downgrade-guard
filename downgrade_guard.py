@@ -126,10 +126,14 @@ def pin_label(check):
 
 # --- Pins from Dockerfiles and compose files ----------------------------------
 
-FROM_RE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)", re.IGNORECASE)
-ARG_RE = re.compile(r"""^\s*ARG\s+(\w+)=["']?([^"'\s]*)""", re.IGNORECASE)
-IMAGE_RE = re.compile(r"""^\s*(?:-\s+)?image:\s*["']?([^"'\s#]+)""")
-VAR_RE = re.compile(r"\$\{(\w+)(?:(:?[-?])([^}]*))?\}|\$(\w+)")
+FROM_RE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.IGNORECASE)
+ARG_RE = re.compile(r"""^\s*ARG\s+(\w+)(?:=(?:"([^"]*)"|'([^']*)'|(\S*)))?""", re.IGNORECASE)
+IMAGE_RE = re.compile(r"""^\s*(?:-\s+)?image:\s*["']?((?:\$\{[^}]*\}|[^"'\s#])+)""")
+VAR_RE = re.compile(r"\$(?:(\$)|\{(\w+)(?:(:?[-?+])([^}]*))?\}|(\w+))")
+UNRESOLVED = "\0"  # stands in for a variable that couldn't be resolved
+COMPOSE_FILES = {"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+COMPOSE_OVERRIDES = ("compose.override.yaml", "compose.override.yml",
+                     "docker-compose.override.yaml", "docker-compose.override.yml")
 
 
 def normalize_image(name):
@@ -152,17 +156,27 @@ def split_image(ref):
 
 
 def _expand(text, variables):
-    """Substitute $VAR, ${VAR} and ${VAR:-default}. Returns (text, unresolved names)."""
+    """Substitute variables like compose does. Returns (text, unresolved names).
+
+    Handles $$, $VAR, ${VAR}, ${VAR:-default}, ${VAR-default}, ${VAR:?err}, ${VAR?err},
+    ${VAR:+alt} and ${VAR+alt}. A variable that can't be resolved becomes UNRESOLVED.
+    """
     missing = []
 
     def substitute(m):
-        name = m[1] or m[4]
-        if variables.get(name):
-            return variables[name]
-        if m[2] in ("-", ":-"):
-            return m[3]
+        if m[1]:
+            return "$"
+        name, op, arg = m[2] or m[5], m[3], m[4]
+        is_set = name in variables
+        value = variables.get(name, "")
+        if op in ("-", ":-"):
+            return value if is_set and (op == "-" or value) else arg
+        if op in ("+", ":+"):
+            return arg if is_set and (op == "+" or value) else ""
+        if is_set and (op != ":?" or value):
+            return value
         missing.append(name)
-        return ""
+        return UNRESOLVED
 
     return VAR_RE.sub(substitute, text), missing
 
@@ -176,72 +190,96 @@ def _read_dotenv(path):
         return values
     for line in lines:
         line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            values[key.removeprefix("export ").strip()] = value.strip().strip("'\"")
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if value[:1] in ("'", '"') and (end := value.find(value[0], 1)) > 0:
+            value = value[1:end]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0]
+        values[key.removeprefix("export ").strip()] = value
     return values
 
 
-def pin_from_file(path, image, tag_regex=None, environ=None):
-    """Find the tag `image` is pinned to in a Dockerfile or a compose/Kubernetes YAML file.
+def _image_refs(path, environ=None):
+    """Yield (where, as written, expanded ref, unresolved names) for each image in a file.
 
-    Dockerfiles: `FROM` lines, with `${VAR}` taken from `ARG VAR=default` lines.
-    YAML files: `image:` lines, with `${VAR}` taken from the environment, then a
-    `.env` file next to it (as docker compose does). `${VAR:-default}` works in both.
-    Returns the tag (or tag_regex's first group). Raises ValueError with the reason.
+    YAML files: `image:` lines; variables from the environment, then `.env` next to the file.
+    Dockerfiles: `FROM` lines that aren't earlier build stages; variables from `ARG` lines
+    before the first `FROM`, the only ones Docker lets a `FROM` use.
     """
-    path = pathlib.Path(path)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as e:
         raise ValueError(f"can't read {path}: {e.strerror}") from None
 
-    is_yaml = path.suffix.lower() in (".yaml", ".yml")
-    build_args = {}
-    if is_yaml:
+    if path.suffix.lower() in (".yaml", ".yml"):
         environ = os.environ if environ is None else environ
         variables = collections.ChainMap(environ, _read_dotenv(path.parent / ".env"))
-    else:
-        variables = build_args
-    pattern = IMAGE_RE if is_yaml else FROM_RE
+        for number, line in enumerate(lines, 1):
+            if m := IMAGE_RE.match(line):
+                yield f"{path}:{number}", m[1], *_expand(m[1], variables)
+        return
+
+    global_args, stages, seen_from = {}, set(), False
+    for number, line in enumerate(lines, 1):
+        if not seen_from and (m := ARG_RE.match(line)):
+            default = next((v for v in m.groups()[1:] if v is not None), None)
+            if default is not None:
+                value, missing = _expand(default, global_args)
+                if not missing:
+                    global_args[m[1]] = value
+            continue
+        if m := FROM_RE.match(line):
+            seen_from = True
+            ref, missing = _expand(m[1], global_args)
+            if ref.lower() not in stages:
+                yield f"{path}:{number}", m[1], ref, missing
+            if m[2]:
+                stages.add(m[2].lower())
+
+
+def pin_from_file(path, image, tag_regex=None, environ=None):
+    """Find the tag `image` is pinned to in a Dockerfile or a compose/Kubernetes YAML file.
+
+    A default compose file is read together with its override file, as docker compose does.
+    Returns the tag (or tag_regex's first group). Raises ValueError with the reason.
+    """
+    path = pathlib.Path(path)
+    files = [path]
+    if path.name in COMPOSE_FILES:
+        files += [path.parent / name for name in COMPOSE_OVERRIDES
+                  if (path.parent / name).is_file()]
 
     want = normalize_image(image)
-    tags, unresolved = set(), []
-    for number, line in enumerate(lines, 1):
-        if not is_yaml and (m := ARG_RE.match(line)):
-            build_args[m[1]] = _expand(m[2], build_args)[0]
-            continue
-        if not (m := pattern.match(line)):
-            continue
-        ref, missing = _expand(m[1], variables)
-        problem = f"line {number}: can't resolve ${missing[0]} in {m[1]!r}" if missing else ""
-        name, tag = split_image(ref)
-        if name == want:
-            if problem:
-                raise ValueError(problem)
-            tags.add(tag)
-        elif problem:
-            unresolved.append(problem)
+    tags = {}  # tag -> where it was first seen
+    for file in files:
+        for where, written, ref, missing in _image_refs(file, environ):
+            name, tag = split_image(ref)
+            if missing and name == want:
+                raise ValueError(f"{where}: can't resolve ${missing[0]} in {written!r}")
+            if missing and UNRESOLVED in name:
+                raise ValueError(f"{where}: can't resolve ${missing[0]} in {written!r}, "
+                                 f"so it could be {image!r}")
+            if name == want:
+                tags.setdefault(tag, where)
 
     if not tags:
-        hint = f" ({unresolved[0]})" if unresolved else ""
-        raise ValueError(f"image {image!r} not found in {path}{hint}")
+        raise ValueError(f"image {image!r} not found in {', '.join(map(str, files))}")
     if len(tags) > 1:
-        found = ", ".join(sorted(t or "no tag" for t in tags))
-        raise ValueError(f"image {image!r} has different tags in {path}: {found}")
-    tag = tags.pop()
+        found = ", ".join(f"{tag or 'no tag'} ({where})" for tag, where in tags.items())
+        raise ValueError(f"image {image!r} has different tags: {found}")
+    tag, where = tags.popitem()
     if not tag:
-        raise ValueError(f"image {image!r} has no tag in {path}; pin a version")
-    pin = tag
-    if tag_regex:
-        m = re.search(tag_regex, tag)
-        if not m:
-            raise ValueError(f"tag_regex didn't match tag {tag!r} of {image!r}")
-        pin = m.group(1)
+        raise ValueError(f"image {image!r} has no tag ({where}); pin a version")
+    pin = extract_version(tag, tag_regex) if tag_regex else tag
+    if pin is None:
+        raise ValueError(f"tag_regex didn't match tag {tag!r} of {image!r} ({where})")
     try:
         parse_version(pin)
     except ValueError:
-        raise ValueError(f"tag {pin!r} of {image!r} in {path} isn't a version; pin one") from None
+        raise ValueError(f"tag {pin!r} of {image!r} ({where}) isn't a version; pin one") from None
     return pin
 
 
@@ -258,7 +296,8 @@ def load_config(path):
         raise ConfigError(f"can't read {path}: {e.strerror}") from None
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: invalid TOML: {e}") from None
-    errors = validate_config(data) or resolve_pins(data, pathlib.Path(path).parent)
+    errors = validate_config(data)
+    errors += resolve_pins(data, pathlib.Path(path).parent)
     if errors:
         raise ConfigError(f"{path}:\n" + "\n".join(f"  - {e}" for e in errors))
     data.setdefault("runtime", "docker")
@@ -266,17 +305,24 @@ def load_config(path):
 
 
 def resolve_pins(config, base_dir):
-    """Fill in `pinned` for checks that use pinned_from. Returns a list of problems."""
+    """Replace each well-formed pinned_from with the pin it points to. Returns the problems."""
+    checks = config.get("check")
+    if not isinstance(checks, list):
+        return []
     errors = []
-    for i, check in enumerate(config["check"], 1):
-        spec = check.get("pinned_from")
-        if spec is None:
-            continue
+    for i, check in enumerate(checks, 1):
+        spec = check.get("pinned_from") if isinstance(check, dict) else None
+        if not isinstance(spec, dict) or not _is_text(spec.get("file")) \
+                or not _is_text(spec.get("image")):
+            continue  # validate_config reports these
         try:
             check["pinned"] = pin_from_file(base_dir / spec["file"], spec["image"],
                                             spec.get("tag_regex"))
+            del check["pinned_from"]
         except ValueError as e:
-            errors.append(f"check #{i} ({check['name']}): pinned_from: {e}")
+            errors.append(f"{_label(i, check)}: pinned_from: {e}")
+        except re.error:
+            pass  # a bad tag_regex; validate_config reports it
     return errors
 
 
@@ -298,10 +344,13 @@ def validate_config(data):
         errors.append("no checks defined; add at least one [[check]] table")
         return errors
     for i, check in enumerate(checks, 1):
-        name = check.get("name")
-        label = f"check #{i}" + (f" ({name})" if isinstance(name, str) and name else "")
-        errors += [f"{label}: {e}" for e in _check_errors(check, runtime)]
+        errors += [f"{_label(i, check)}: {e}" for e in _check_errors(check, runtime)]
     return errors
+
+
+def _label(i, check):
+    name = check.get("name")
+    return f"check #{i}" + (f" ({name})" if isinstance(name, str) and name else "")
 
 
 def _is_text(value):
@@ -323,7 +372,7 @@ def _regex_errors(regex, key):
     return []
 
 
-def _check_errors(check, runtime="docker"):
+def _check_errors(check, runtime):
     errors = [f"unknown field {key!r}" for key in sorted(check.keys() - CHECK_FIELDS)]
 
     for key in ("name", "container"):
@@ -348,10 +397,10 @@ def _check_errors(check, runtime="docker"):
         errors.append(f"'rule' must be one of {', '.join(RULE_FIELDS)}; got {rule!r}")
     else:
         for key in RULE_FIELDS[rule]:
-            if key == "pinned" and "pinned_from" not in check and key not in check:
-                errors.append(f"rule {rule!r} needs 'pinned' (or 'pinned_from')")
-            elif key != "pinned" and key not in check:
-                errors.append(f"rule {rule!r} needs {key!r}")
+            if key in check or (key == "pinned" and "pinned_from" in check):
+                continue
+            hint = " (or 'pinned_from')" if key == "pinned" else ""
+            errors.append(f"rule {rule!r} needs {key!r}{hint}")
 
     valid_versions = {}
     for key in ("pinned", "min", "max"):
@@ -432,9 +481,9 @@ KLOG_LINE_RE = re.compile(r"^[IWEF]\d{4} \d\d:\d\d:\d\d\.\d+\s+\d+ \S+:\d+\] ")
 
 
 def _without_kubectl_noise(output):
-    """Drop kubectl's own log lines and its "Defaulted container" notice; keep everything else."""
+    """Drop kubectl's own log lines and the API server's "Warning: ..." lines."""
     lines = [line for line in output.splitlines()
-             if not line.startswith("Defaulted container ") and not KLOG_LINE_RE.match(line)]
+             if not line.startswith("Warning: ") and not KLOG_LINE_RE.match(line)]
     return "\n".join(lines)
 
 
@@ -446,9 +495,9 @@ def container_problem(config, container):
         rc, out = run([*_kubectl(config), "get", target, "-o", "jsonpath={.status.phase}"])
         out = _without_kubectl_noise(out)
         if rc != 0:
-            if "(NotFound)" in out:
-                return f"{target} not found"
-            return f"kubectl get failed: {_snippet(out)}"
+            # e.g. 'Error from server (NotFound): namespaces "data" not found'
+            _, found, missing = out.partition("(NotFound): ")
+            return _snippet(missing) if found else f"kubectl get failed: {_snippet(out)}"
         is_pod = target.split("/", 1)[0] in ("pod", "pods", "po")
         if is_pod and out.strip() != "Running":
             return f"pod not running ({out.strip() or 'unknown phase'})"
@@ -469,7 +518,7 @@ def exec_in(config, check, cmd):
     runtime = config.get("runtime", "docker")
     if runtime != "kubectl":
         return run([runtime, "exec", check["container"], *cmd])
-    args = [*_kubectl(config), "exec", check["container"]]
+    args = [*_kubectl(config), "exec", "--quiet", check["container"]]
     if "pod_container" in check:
         args += ["-c", check["pod_container"]]
     rc, out = run([*args, "--", *cmd])
