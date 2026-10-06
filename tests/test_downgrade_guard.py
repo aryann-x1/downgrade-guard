@@ -756,6 +756,27 @@ services:
                       "FROM redis:${VERSION}\n")
         self.assertEqual(self.pin("Dockerfile", dockerfile, "redis"), "8.4.0")
 
+    def test_dockerfile_arg_line_with_several_names(self):
+        dockerfile = 'ARG A=1 VERSION="8.4.0" B\nFROM redis:${VERSION}\n'
+        self.assertEqual(self.pin("Dockerfile", dockerfile, "redis"), "8.4.0")
+
+    def test_yaml_anchor_on_image_line(self):
+        compose = ("services:\n  a:\n    image: &img redis:7.2.0\n"
+                   "  b:\n    image: redis:8.4.0\n")
+        self.assertPinError("different tags: 7.2.0", "compose.yaml", compose, "redis")
+
+    def test_yaml_alias_to_scalar_anchor(self):
+        compose = ("x-redis-image: &redis-image redis:7.2.0\n"
+                   "services:\n  a:\n    image: *redis-image\n")
+        self.assertEqual(self.pin("compose.yaml", compose, "redis"), "7.2.0")
+        self.assertPinError("different tags: 7.2.0", "compose.yaml",
+                            compose + "  b:\n    image: redis:8.4.0\n", "redis")
+
+    def test_yaml_alias_that_cant_be_followed(self):
+        compose = "services:\n  a:\n    image: *elsewhere\n  b:\n    image: redis:8.4.0\n"
+        self.assertPinError("can't resolve YAML alias *elsewhere", "compose.yaml", compose,
+                            "redis")
+
     def test_dockerfile_arg_without_default(self):
         self.assertPinError("can't resolve $VERSION", "Dockerfile",
                             "ARG VERSION\nFROM redis:${VERSION}\n", "redis")
@@ -876,6 +897,21 @@ rule        = "newest"
             dg.load_config(config)
         self.assertIn("check #1 (Redis): pinned_from: can't read", str(ctx.exception))
         self.assertIn("check #2 (Typo): 'rule' must be one of", str(ctx.exception))
+
+    def test_load_config_with_bad_tag_regex_reports_instead_of_crashing(self):
+        self.write("compose.yaml", "services:\n  r:\n    image: redis:8.4.0-pg17\n")
+        for regex, message in [("5", "must be a string"), ("'pg'", "capture group")]:
+            config = self.write("downgrade-guard.toml", f"""
+[[check]]
+name        = "Redis"
+container   = "redis"
+version_cmd = ["redis-server", "--version"]
+rule        = "not_newer"
+pinned_from = {{ file = "compose.yaml", image = "redis", tag_regex = {regex} }}
+""")
+            with self.subTest(regex=regex), self.assertRaises(dg.ConfigError) as ctx:
+                dg.load_config(config)
+            self.assertIn(message, str(ctx.exception))
 
     def test_load_config_reports_pin_errors(self):
         config = self.write("downgrade-guard.toml", """

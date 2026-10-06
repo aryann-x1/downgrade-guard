@@ -127,8 +127,11 @@ def pin_label(check):
 # --- Pins from Dockerfiles and compose files ----------------------------------
 
 FROM_RE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.IGNORECASE)
-ARG_RE = re.compile(r"""^\s*ARG\s+(\w+)(?:=(?:"([^"]*)"|'([^']*)'|(\S*)))?""", re.IGNORECASE)
-IMAGE_RE = re.compile(r"""^\s*(?:-\s+)?image:\s*["']?((?:\$\{[^}]*\}|[^"'\s#])+)""")
+ARG_RE = re.compile(r"^\s*ARG\s+(.*)", re.IGNORECASE)
+ARG_PAIR_RE = re.compile(r"""(\w+)(?:=(?:"([^"]*)"|'([^']*)'|(\S*)))?""")
+YAML_VALUE = r"""["']?((?:\$\{[^}]*\}|[^"'\s#])+)"""
+IMAGE_RE = re.compile(r"^\s*(?:-\s+)?image:\s*(?:&\S+\s+)?" + YAML_VALUE)
+ANCHOR_RE = re.compile(r"&([^\s\[\]{},]+)\s+" + YAML_VALUE)  # scalar anchors: &name value
 VAR_RE = re.compile(r"\$(?:(\$)|\{(\w+)(?:(:?[-?+])([^}]*))?\}|(\w+))")
 UNRESOLVED = "\0"  # stands in for a variable that couldn't be resolved
 COMPOSE_FILES = {"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
@@ -203,11 +206,12 @@ def _read_dotenv(path):
 
 
 def _image_refs(path, environ=None):
-    """Yield (where, as written, expanded ref, unresolved names) for each image in a file.
+    """Yield (where, as written, expanded ref, what couldn't be resolved) for each image in a file.
 
-    YAML files: `image:` lines; variables from the environment, then `.env` next to the file.
-    Dockerfiles: `FROM` lines that aren't earlier build stages; variables from `ARG` lines
-    before the first `FROM`, the only ones Docker lets a `FROM` use.
+    YAML files: `image:` lines, following YAML aliases to scalar anchors; variables from the
+    environment, then `.env` next to the file. Dockerfiles: `FROM` lines that aren't earlier
+    build stages; variables from `ARG` lines before the first `FROM`, the only ones Docker lets
+    a `FROM` use.
     """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -217,25 +221,35 @@ def _image_refs(path, environ=None):
     if path.suffix.lower() in (".yaml", ".yml"):
         environ = os.environ if environ is None else environ
         variables = collections.ChainMap(environ, _read_dotenv(path.parent / ".env"))
+        anchors = dict(m.groups() for line in lines for m in ANCHOR_RE.finditer(line))
         for number, line in enumerate(lines, 1):
-            if m := IMAGE_RE.match(line):
-                yield f"{path}:{number}", m[1], *_expand(m[1], variables)
+            if not (m := IMAGE_RE.match(line)):
+                continue
+            written = m[1]
+            if written.startswith("*"):  # a YAML alias
+                if written[1:] not in anchors:
+                    yield f"{path}:{number}", written, UNRESOLVED, [f"YAML alias {written}"]
+                    continue
+                written = anchors[written[1:]]
+            ref, missing = _expand(written, variables)
+            yield f"{path}:{number}", written, ref, [f"${name}" for name in missing]
         return
 
     global_args, stages, seen_from = {}, set(), False
     for number, line in enumerate(lines, 1):
         if not seen_from and (m := ARG_RE.match(line)):
-            default = next((v for v in m.groups()[1:] if v is not None), None)
-            if default is not None:
-                value, missing = _expand(default, global_args)
-                if not missing:
-                    global_args[m[1]] = value
+            for pair in ARG_PAIR_RE.finditer(m[1]):  # ARG A=1 B="2"
+                default = next((v for v in pair.groups()[1:] if v is not None), None)
+                if default is not None:
+                    value, missing = _expand(default, global_args)
+                    if not missing:
+                        global_args[pair[1]] = value
             continue
         if m := FROM_RE.match(line):
             seen_from = True
             ref, missing = _expand(m[1], global_args)
             if ref.lower() not in stages:
-                yield f"{path}:{number}", m[1], ref, missing
+                yield f"{path}:{number}", m[1], ref, [f"${name}" for name in missing]
             if m[2]:
                 stages.add(m[2].lower())
 
@@ -258,9 +272,9 @@ def pin_from_file(path, image, tag_regex=None, environ=None):
         for where, written, ref, missing in _image_refs(file, environ):
             name, tag = split_image(ref)
             if missing and name == want:
-                raise ValueError(f"{where}: can't resolve ${missing[0]} in {written!r}")
+                raise ValueError(f"{where}: can't resolve {missing[0]} in {written!r}")
             if missing and UNRESOLVED in name:
-                raise ValueError(f"{where}: can't resolve ${missing[0]} in {written!r}, "
+                raise ValueError(f"{where}: can't resolve {missing[0]} in {written!r}, "
                                  f"so it could be {image!r}")
             if name == want:
                 tags.setdefault(tag, where)
@@ -312,8 +326,9 @@ def resolve_pins(config, base_dir):
     errors = []
     for i, check in enumerate(checks, 1):
         spec = check.get("pinned_from") if isinstance(check, dict) else None
-        if not isinstance(spec, dict) or not _is_text(spec.get("file")) \
-                or not _is_text(spec.get("image")):
+        if (not isinstance(spec, dict) or not _is_text(spec.get("file"))
+                or not _is_text(spec.get("image"))
+                or _regex_errors(spec.get("tag_regex", "(.*)"), "tag_regex")):
             continue  # validate_config reports these
         try:
             check["pinned"] = pin_from_file(base_dir / spec["file"], spec["image"],
@@ -321,8 +336,6 @@ def resolve_pins(config, base_dir):
             del check["pinned_from"]
         except ValueError as e:
             errors.append(f"{_label(i, check)}: pinned_from: {e}")
-        except re.error:
-            pass  # a bad tag_regex; validate_config reports it
     return errors
 
 

@@ -158,7 +158,8 @@ How files are read:
   isn't used, because `docker build` doesn't use it either.
 - **Compose files and Kubernetes manifests** (`.yaml`/`.yml`): `image:` lines. Variables come from
   the environment, then from a `.env` file next to the compose file, with compose's quoting and
-  `# comment` rules.
+  `# comment` rules. YAML aliases (`image: *redis-image`) are followed to their anchor
+  (`x-redis-image: &redis-image redis:8.4.0`); an alias that can't be followed is an error.
 - **Compose override files:** if `file` is a default compose name (`compose.yaml`,
   `compose.yml`, `docker-compose.yaml` or `docker-compose.yml`), any
   `compose.override.yaml`-style file next to it is read too, because `docker compose` merges it
