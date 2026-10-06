@@ -1,0 +1,25 @@
+# The same checks on Kubernetes, via `kubectl exec`.
+#
+# `container` is anything `kubectl exec` accepts: a pod name ("redis-0") or
+# "<kind>/<name>" ("statefulset/db", "deployment/keycloak"). For a kind/name,
+# kubectl picks one of its pods, which is fine because they all run the same
+# image. `pod_container` picks the container inside a multi-container pod (-c).
+runtime   = "kubectl"
+namespace = "data"         # optional; default: the context's namespace
+# context = "production"   # optional; default: the current kubectl context
+
+[[check]]
+name          = "Postgres"
+container     = "statefulset/db"
+pod_container = "postgres"
+version_cmd   = ["psql", "-U", "postgres", "-tAc", "show server_version"]
+pinned        = "17"
+rule          = "same_major"
+
+[[check]]
+name        = "Keycloak"
+container   = "deployment/keycloak"
+version_cmd = ["/opt/keycloak/bin/kc.sh", "--version"]
+version_regex = 'Keycloak (\d+\.\d+\.\d+)'
+pinned      = "26.4.0"
+rule        = "not_newer"

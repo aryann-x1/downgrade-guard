@@ -5,25 +5,31 @@ Reads the versions actually running in containers, compares them with the
 versions about to be deployed, and exits non-zero if any stateful service
 would be downgraded.
 
-Read-only: the only commands it runs are `<runtime> container inspect` (to see
-whether a container is up) and the version commands from your config, via
-`<runtime> exec`.
+Read-only: the only commands it runs are `<runtime> container inspect` or
+`kubectl get` (to see whether a container is up) and the version commands from
+your config, via `<runtime> exec` or `kubectl exec`.
 
-Usage:  python downgrade_guard.py check [-c downgrade-guard.toml]
+Usage:  python downgrade_guard.py check [-c downgrade-guard.toml] [--json]
 Exit:   0 = all OK, 1 = at least one STOP, 2 = something couldn't be checked
 """
 
 import argparse
+import collections
+import json
+import os
+import pathlib
 import re
 import subprocess
 import sys
 import tomllib
 from typing import NamedTuple
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 EXIT_OK, EXIT_STOP, EXIT_UNCHECKED = 0, 1, 2
-RUNTIMES = ("docker", "podman")
+RUNTIMES = ("docker", "podman", "kubectl")
+KUBECTL_FIELDS = ("namespace", "context")
+TOP_LEVEL_FIELDS = {"runtime", "check", *KUBECTL_FIELDS}
 RULE_FIELDS = {  # rule -> fields it requires
     "not_newer": ("pinned",),
     "within": ("min", "max"),
@@ -31,8 +37,9 @@ RULE_FIELDS = {  # rule -> fields it requires
     "same_minor": ("pinned",),
     "info": (),
 }
-CHECK_FIELDS = {"name", "container", "version_cmd", "version_regex", "for_each",
-                "rule", "pinned", "min", "max"}
+CHECK_FIELDS = {"name", "container", "pod_container", "version_cmd", "version_regex",
+                "for_each", "rule", "pinned", "pinned_from", "min", "max"}
+PINNED_FROM_FIELDS = {"file", "image", "tag_regex"}
 DEFAULT_VERSION_REGEX = r"v?(\d+(?:\.\d+)+)"
 COMMAND_TIMEOUT = 30  # seconds per command
 
@@ -73,8 +80,10 @@ def compare_versions(a, b):
 
 def extract_version(output, regex=None):
     """Find the version in a command's output: first capture group of `regex`, or None."""
-    m = re.search(regex or DEFAULT_VERSION_REGEX, output)
-    return m.group(1).strip() if m else None
+    for m in re.finditer(regex or DEFAULT_VERSION_REGEX, output):
+        if m.group(1):  # an optional group can match nothing
+            return m.group(1).strip()
+    return None
 
 
 # --- Rules --------------------------------------------------------------------
@@ -115,10 +124,183 @@ def pin_label(check):
     return check.get("pinned", "-")
 
 
+# --- Pins from Dockerfiles and compose files ----------------------------------
+
+FROM_RE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", re.IGNORECASE)
+ARG_RE = re.compile(r"^\s*ARG\s+(.*)", re.IGNORECASE)
+ARG_PAIR_RE = re.compile(r"""(\w+)(?:=(?:"([^"]*)"|'([^']*)'|(\S*)))?""")
+YAML_VALUE = r"""["']?((?:\$\{[^}]*\}|[^"'\s#])+)"""
+IMAGE_RE = re.compile(r"^\s*(?:-\s+)?image:\s*(?:&\S+\s+)?" + YAML_VALUE)
+ANCHOR_RE = re.compile(r"&([^\s\[\]{},]+)\s+" + YAML_VALUE)  # scalar anchors: &name value
+VAR_RE = re.compile(r"\$(?:(\$)|\{(\w+)(?:(:?[-?+])([^}]*))?\}|(\w+))")
+UNRESOLVED = "\0"  # stands in for a variable that couldn't be resolved
+COMPOSE_FILES = {"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+COMPOSE_OVERRIDES = ("compose.override.yaml", "compose.override.yml",
+                     "docker-compose.override.yaml", "docker-compose.override.yml")
+
+
+def normalize_image(name):
+    """'docker.io/library/Redis' -> 'redis', so equivalent Docker Hub names compare equal."""
+    name = name.lower()
+    for prefix in ("docker.io/", "index.docker.io/", "registry-1.docker.io/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    return name.removeprefix("library/")
+
+
+def split_image(ref):
+    """'docker.io/library/redis:8.4.0-alpine@sha256:...' -> ('redis', '8.4.0-alpine')."""
+    ref = ref.split("@", 1)[0]
+    colon = ref.rfind(":")
+    if colon > ref.rfind("/"):  # a colon before the last slash is a registry port
+        return normalize_image(ref[:colon]), ref[colon + 1:]
+    return normalize_image(ref), ""
+
+
+def _expand(text, variables):
+    """Substitute variables like compose does. Returns (text, unresolved names).
+
+    Handles $$, $VAR, ${VAR}, ${VAR:-default}, ${VAR-default}, ${VAR:?err}, ${VAR?err},
+    ${VAR:+alt} and ${VAR+alt}. A variable that can't be resolved becomes UNRESOLVED.
+    """
+    missing = []
+
+    def substitute(m):
+        if m[1]:
+            return "$"
+        name, op, arg = m[2] or m[5], m[3], m[4]
+        is_set = name in variables
+        value = variables.get(name, "")
+        if op in ("-", ":-"):
+            return value if is_set and (op == "-" or value) else arg
+        if op in ("+", ":+"):
+            return arg if is_set and (op == "+" or value) else ""
+        if is_set and (op != ":?" or value):
+            return value
+        missing.append(name)
+        return UNRESOLVED
+
+    return VAR_RE.sub(substitute, text), missing
+
+
+def _read_dotenv(path):
+    """KEY=VALUE lines from a compose-style .env file (empty if there isn't one)."""
+    values = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if value[:1] in ("'", '"') and (end := value.find(value[0], 1)) > 0:
+            value = value[1:end]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0]
+        values[key.removeprefix("export ").strip()] = value
+    return values
+
+
+def _image_refs(path, environ=None):
+    """Yield (where, as written, expanded ref, what couldn't be resolved) for each image in a file.
+
+    YAML files: `image:` lines, following YAML aliases to scalar anchors; variables from the
+    environment, then `.env` next to the file. Dockerfiles: `FROM` lines that aren't earlier
+    build stages; variables from `ARG` lines before the first `FROM`, the only ones Docker lets
+    a `FROM` use.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        raise ValueError(f"can't read {path}: {e.strerror}") from None
+
+    if path.suffix.lower() in (".yaml", ".yml"):
+        environ = os.environ if environ is None else environ
+        variables = collections.ChainMap(environ, _read_dotenv(path.parent / ".env"))
+        anchors = dict(m.groups() for line in lines for m in ANCHOR_RE.finditer(line))
+        for number, line in enumerate(lines, 1):
+            if not (m := IMAGE_RE.match(line)):
+                continue
+            written = m[1]
+            if written.startswith("*"):  # a YAML alias
+                if written[1:] not in anchors:
+                    yield f"{path}:{number}", written, UNRESOLVED, [f"YAML alias {written}"]
+                    continue
+                written = anchors[written[1:]]
+            ref, missing = _expand(written, variables)
+            yield f"{path}:{number}", written, ref, [f"${name}" for name in missing]
+        return
+
+    global_args, stages, seen_from = {}, set(), False
+    for number, line in enumerate(lines, 1):
+        if not seen_from and (m := ARG_RE.match(line)):
+            for pair in ARG_PAIR_RE.finditer(m[1]):  # ARG A=1 B="2"
+                default = next((v for v in pair.groups()[1:] if v is not None), None)
+                if default is not None:
+                    value, missing = _expand(default, global_args)
+                    if not missing:
+                        global_args[pair[1]] = value
+            continue
+        if m := FROM_RE.match(line):
+            seen_from = True
+            ref, missing = _expand(m[1], global_args)
+            if ref.lower() not in stages:
+                yield f"{path}:{number}", m[1], ref, [f"${name}" for name in missing]
+            if m[2]:
+                stages.add(m[2].lower())
+
+
+def pin_from_file(path, image, tag_regex=None, environ=None):
+    """Find the tag `image` is pinned to in a Dockerfile or a compose/Kubernetes YAML file.
+
+    A default compose file is read together with its override file, as docker compose does.
+    Returns the tag (or tag_regex's first group). Raises ValueError with the reason.
+    """
+    path = pathlib.Path(path)
+    files = [path]
+    if path.name in COMPOSE_FILES:
+        files += [path.parent / name for name in COMPOSE_OVERRIDES
+                  if (path.parent / name).is_file()]
+
+    want = normalize_image(image)
+    tags = {}  # tag -> where it was first seen
+    for file in files:
+        for where, written, ref, missing in _image_refs(file, environ):
+            name, tag = split_image(ref)
+            if missing and name == want:
+                raise ValueError(f"{where}: can't resolve {missing[0]} in {written!r}")
+            if missing and UNRESOLVED in name:
+                raise ValueError(f"{where}: can't resolve {missing[0]} in {written!r}, "
+                                 f"so it could be {image!r}")
+            if name == want:
+                tags.setdefault(tag, where)
+
+    if not tags:
+        raise ValueError(f"image {image!r} not found in {', '.join(map(str, files))}")
+    if len(tags) > 1:
+        found = ", ".join(f"{tag or 'no tag'} ({where})" for tag, where in tags.items())
+        raise ValueError(f"image {image!r} has different tags: {found}")
+    tag, where = tags.popitem()
+    if not tag:
+        raise ValueError(f"image {image!r} has no tag ({where}); pin a version")
+    pin = extract_version(tag, tag_regex) if tag_regex else tag
+    if pin is None:
+        raise ValueError(f"tag_regex didn't match tag {tag!r} of {image!r} ({where})")
+    try:
+        parse_version(pin)
+    except ValueError:
+        raise ValueError(f"tag {pin!r} of {image!r} ({where}) isn't a version; pin one") from None
+    return pin
+
+
 # --- Config -------------------------------------------------------------------
 
 def load_config(path):
-    """Read and validate the TOML config. Raises ConfigError with every problem found."""
+    """Read, validate and resolve the TOML config. Raises ConfigError with every problem found."""
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)
@@ -129,40 +311,91 @@ def load_config(path):
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: invalid TOML: {e}") from None
     errors = validate_config(data)
+    errors += resolve_pins(data, pathlib.Path(path).parent)
     if errors:
         raise ConfigError(f"{path}:\n" + "\n".join(f"  - {e}" for e in errors))
     data.setdefault("runtime", "docker")
     return data
 
 
+def resolve_pins(config, base_dir):
+    """Replace each well-formed pinned_from with the pin it points to. Returns the problems."""
+    checks = config.get("check")
+    if not isinstance(checks, list):
+        return []
+    errors = []
+    for i, check in enumerate(checks, 1):
+        spec = check.get("pinned_from") if isinstance(check, dict) else None
+        if (not isinstance(spec, dict) or not _is_text(spec.get("file"))
+                or not _is_text(spec.get("image"))
+                or _regex_errors(spec.get("tag_regex", "(.*)"), "tag_regex")):
+            continue  # validate_config reports these
+        try:
+            check["pinned"] = pin_from_file(base_dir / spec["file"], spec["image"],
+                                            spec.get("tag_regex"))
+            del check["pinned_from"]
+        except ValueError as e:
+            errors.append(f"{_label(i, check)}: pinned_from: {e}")
+    return errors
+
+
 def validate_config(data):
     """Return a list of human-readable problems (empty if the config is valid)."""
-    errors = [f"unknown top-level key {key!r}" for key in sorted(data.keys() - {"runtime", "check"})]
+    errors = [f"unknown top-level key {key!r}" for key in sorted(data.keys() - TOP_LEVEL_FIELDS)]
     runtime = data.get("runtime", "docker")
     if runtime not in RUNTIMES:
         errors.append(f"runtime must be one of {', '.join(RUNTIMES)}; got {runtime!r}")
+    for key in KUBECTL_FIELDS:
+        if key not in data:
+            continue
+        if runtime != "kubectl":
+            errors.append(f"{key!r} only applies to runtime = \"kubectl\"")
+        elif not _is_text(data[key]):
+            errors.append(f"{key!r} must be a non-empty string")
     checks = data.get("check")
     if not isinstance(checks, list) or not checks or not all(isinstance(c, dict) for c in checks):
         errors.append("no checks defined; add at least one [[check]] table")
         return errors
     for i, check in enumerate(checks, 1):
-        name = check.get("name")
-        label = f"check #{i}" + (f" ({name})" if isinstance(name, str) and name else "")
-        errors += [f"{label}: {e}" for e in _check_errors(check)]
+        errors += [f"{_label(i, check)}: {e}" for e in _check_errors(check, runtime)]
     return errors
+
+
+def _label(i, check):
+    name = check.get("name")
+    return f"check #{i}" + (f" ({name})" if isinstance(name, str) and name else "")
+
+
+def _is_text(value):
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _is_command(value):
     return isinstance(value, list) and value and all(isinstance(a, str) for a in value)
 
 
-def _check_errors(check):
+def _regex_errors(regex, key):
+    if not isinstance(regex, str):
+        return [f"{key!r} must be a string"]
+    try:
+        if re.compile(regex).groups < 1:
+            return [f"{key!r} needs a capture group around the version"]
+    except re.error as e:
+        return [f"{key!r} is not a valid regex: {e}"]
+    return []
+
+
+def _check_errors(check, runtime):
     errors = [f"unknown field {key!r}" for key in sorted(check.keys() - CHECK_FIELDS)]
 
     for key in ("name", "container"):
-        value = check.get(key)
-        if not isinstance(value, str) or not value.strip():
+        if not _is_text(check.get(key)):
             errors.append(f"{key!r} must be a non-empty string")
+    if "pod_container" in check:
+        if runtime != "kubectl":
+            errors.append("'pod_container' only applies to runtime = \"kubectl\"")
+        elif not _is_text(check["pod_container"]):
+            errors.append("'pod_container' must be a non-empty string")
     if not _is_command(check.get("version_cmd")):
         errors.append("'version_cmd' must be a non-empty list of strings")
     if "for_each" in check and not _is_command(check["for_each"]):
@@ -176,7 +409,11 @@ def _check_errors(check):
     if rule not in RULE_FIELDS:
         errors.append(f"'rule' must be one of {', '.join(RULE_FIELDS)}; got {rule!r}")
     else:
-        errors += [f"rule {rule!r} needs {key!r}" for key in RULE_FIELDS[rule] if key not in check]
+        for key in RULE_FIELDS[rule]:
+            if key in check or (key == "pinned" and "pinned_from" in check):
+                continue
+            hint = " (or 'pinned_from')" if key == "pinned" else ""
+            errors.append(f"rule {rule!r} needs {key!r}{hint}")
 
     valid_versions = {}
     for key in ("pinned", "min", "max"):
@@ -196,15 +433,28 @@ def _check_errors(check):
             errors.append("'min' is greater than 'max'")
 
     if "version_regex" in check:
-        regex = check["version_regex"]
-        if not isinstance(regex, str):
-            errors.append("'version_regex' must be a string")
-        else:
-            try:
-                if re.compile(regex).groups < 1:
-                    errors.append("'version_regex' needs a capture group around the version")
-            except re.error as e:
-                errors.append(f"'version_regex' is not a valid regex: {e}")
+        errors += _regex_errors(check["version_regex"], "version_regex")
+    if "pinned_from" in check:
+        errors += _pinned_from_errors(check, rule)
+    return errors
+
+
+def _pinned_from_errors(check, rule):
+    spec = check["pinned_from"]
+    if not isinstance(spec, dict):
+        return ["'pinned_from' must be a table, "
+                "e.g. pinned_from = { file = \"compose.yaml\", image = \"redis\" }"]
+    errors = [f"unknown field 'pinned_from.{key}'"
+              for key in sorted(spec.keys() - PINNED_FROM_FIELDS)]
+    for key in ("file", "image"):
+        if not _is_text(spec.get(key)):
+            errors.append(f"'pinned_from.{key}' must be a non-empty string")
+    if "pinned" in check:
+        errors.append("use either 'pinned' or 'pinned_from', not both")
+    if rule == "within":
+        errors.append("'pinned_from' doesn't apply to rule 'within' (it uses 'min' and 'max')")
+    if "tag_regex" in spec:
+        errors += _regex_errors(spec["tag_regex"], "pinned_from.tag_regex")
     return errors
 
 
@@ -230,8 +480,42 @@ def _snippet(output, limit=80):
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def container_problem(runtime, container):
+def _kubectl(config):
+    """`kubectl` plus the configured --context and --namespace flags."""
+    args = ["kubectl"]
+    if "context" in config:
+        args += ["--context", config["context"]]
+    if "namespace" in config:
+        args += ["--namespace", config["namespace"]]
+    return args
+
+
+KLOG_LINE_RE = re.compile(r"^[IWEF]\d{4} \d\d:\d\d:\d\d\.\d+\s+\d+ \S+:\d+\] ")
+
+
+def _without_kubectl_noise(output):
+    """Drop kubectl's own log lines and the API server's "Warning: ..." lines."""
+    lines = [line for line in output.splitlines()
+             if not line.startswith("Warning: ") and not KLOG_LINE_RE.match(line)]
+    return "\n".join(lines)
+
+
+def container_problem(config, container):
     """None if the container is running, otherwise the reason it can't be checked."""
+    runtime = config.get("runtime", "docker")
+    if runtime == "kubectl":
+        target = container if "/" in container else f"pod/{container}"
+        rc, out = run([*_kubectl(config), "get", target, "-o", "jsonpath={.status.phase}"])
+        out = _without_kubectl_noise(out)
+        if rc != 0:
+            # e.g. 'Error from server (NotFound): namespaces "data" not found'
+            _, found, missing = out.partition("(NotFound): ")
+            return _snippet(missing) if found else f"kubectl get failed: {_snippet(out)}"
+        is_pod = target.split("/", 1)[0] in ("pod", "pods", "po")
+        if is_pod and out.strip() != "Running":
+            return f"pod not running ({out.strip() or 'unknown phase'})"
+        return None
+
     rc, out = run([runtime, "container", "inspect", "--format", "{{.State.Running}}", container])
     if rc != 0:
         if "no such" in out.lower():
@@ -242,9 +526,21 @@ def container_problem(runtime, container):
     return None
 
 
-def _check_item(runtime, check, name, cmd, pin, skip_empty):
+def exec_in(config, check, cmd):
+    """Run cmd inside the check's container -> (exit code, output)."""
+    runtime = config.get("runtime", "docker")
+    if runtime != "kubectl":
+        return run([runtime, "exec", check["container"], *cmd])
+    args = [*_kubectl(config), "exec", "--quiet", check["container"]]
+    if "pod_container" in check:
+        args += ["-c", check["pod_container"]]
+    rc, out = run([*args, "--", *cmd])
+    return rc, _without_kubectl_noise(out)
+
+
+def _check_item(config, check, name, cmd, pin, skip_empty):
     """Run one version command and judge it. Returns a Row, or None if skipped."""
-    rc, out = run([runtime, "exec", check["container"], *cmd])
+    rc, out = exec_in(config, check, cmd)
     if rc != 0:
         return Row(name, "-", pin, "CHECK", f"command failed (exit {rc}): {_snippet(out)}")
     if not out.strip():
@@ -259,21 +555,21 @@ def _check_item(runtime, check, name, cmd, pin, skip_empty):
     return Row(name, running, pin, result, reason)
 
 
-def run_check(runtime, check):
+def run_check(config, check):
     """Run one [[check]] (expanding for_each) and return its table rows."""
     name, pin = check["name"], pin_label(check)
     if "for_each" not in check:
-        return [_check_item(runtime, check, name, check["version_cmd"], pin, skip_empty=False)]
+        return [_check_item(config, check, name, check["version_cmd"], pin, skip_empty=False)]
 
     group_name = name.replace("{item}", "*")
-    rc, out = run([runtime, "exec", check["container"], *check["for_each"]])
+    rc, out = exec_in(config, check, check["for_each"])
     if rc != 0:
         return [Row(group_name, "-", pin, "CHECK", f"for_each failed (exit {rc}): {_snippet(out)}")]
     items = [line.strip() for line in out.splitlines() if line.strip()]
     rows = []
     for item in items:
         cmd = [arg.replace("{item}", item) for arg in check["version_cmd"]]
-        row = _check_item(runtime, check, name.replace("{item}", item), cmd, pin, skip_empty=True)
+        row = _check_item(config, check, name.replace("{item}", item), cmd, pin, skip_empty=True)
         if row:
             rows.append(row)
     if not rows:
@@ -284,18 +580,17 @@ def run_check(runtime, check):
 
 def check_all(config):
     """Run every check in the config and return all rows."""
-    runtime = config.get("runtime", "docker")
     problems = {}  # container -> reason it can't be checked (None if running)
     rows = []
     for check in config["check"]:
         container = check["container"]
         if container not in problems:
-            problems[container] = container_problem(runtime, container)
+            problems[container] = container_problem(config, container)
         if problems[container]:
             rows.append(Row(check["name"].replace("{item}", "*"), "-", pin_label(check),
                             "CHECK", problems[container]))
         else:
-            rows += run_check(runtime, check)
+            rows += run_check(config, check)
     return rows
 
 
@@ -322,6 +617,22 @@ def format_table(rows):
     return "\n".join(out)
 
 
+def format_json(rows, code, error=None):
+    def value(text):
+        return None if text in ("", "-") else text
+
+    report = {
+        "tool_version": __version__,
+        "exit_code": code,
+        "results": [{"component": row.name, "running": value(row.running),
+                     "pin": value(row.pin), "result": row.result, "reason": value(row.reason)}
+                    for row in rows],
+    }
+    if error:
+        report["error"] = error
+    return json.dumps(report, indent=2)
+
+
 def summary(rows):
     stops = sum(row.result == "STOP" for row in rows)
     unchecked = sum(row.result == "CHECK" for row in rows)
@@ -344,19 +655,28 @@ def main(argv=None):
         "check", help="compare running versions with the versions about to be deployed")
     check_cmd.add_argument("-c", "--config", default="downgrade-guard.toml",
                            help="path to the config file (default: ./downgrade-guard.toml)")
+    check_cmd.add_argument("--json", action="store_true",
+                           help="print the results as JSON instead of a table")
     args = parser.parse_args(argv)
 
     try:
         config = load_config(args.config)
     except ConfigError as e:
-        print(f"downgrade-guard: {e}", file=sys.stderr)
+        if args.json:
+            print(format_json([], EXIT_UNCHECKED, error=str(e)))
+        else:
+            print(f"downgrade-guard: {e}", file=sys.stderr)
         return EXIT_UNCHECKED
 
     rows = check_all(config)
-    print(format_table(rows))
-    print()
-    print(summary(rows))
-    return exit_code(rows)
+    code = exit_code(rows)
+    if args.json:
+        print(format_json(rows, code))
+    else:
+        print(format_table(rows))
+        print()
+        print(summary(rows))
+    return code
 
 
 if __name__ == "__main__":
