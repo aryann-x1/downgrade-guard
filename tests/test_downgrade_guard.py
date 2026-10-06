@@ -180,6 +180,10 @@ class ExtractVersionTest(unittest.TestCase):
         output = "Keycloak 26.4.0\nJVM: 21.0.8\nOS: Linux 6.1.0"
         self.assertEqual(dg.extract_version(output, r"JVM: (\d+\.\d+\.\d+)"), "21.0.8")
 
+    def test_optional_group(self):
+        self.assertIsNone(dg.extract_version("no version here", r"(\d+\.\d+)?"))
+        self.assertEqual(dg.extract_version("server 2.30.1", r"(\d+\.\d+\.\d+)?"), "2.30.1")
+
     def test_not_found(self):
         self.assertIsNone(dg.extract_version("no version here"))
         self.assertIsNone(dg.extract_version("17"))  # default needs at least one dot
@@ -438,6 +442,12 @@ class CheckAllTest(unittest.TestCase):
         outputs = {**SPEC_OUTPUTS, ("redis", "redis-server", "--version"): (0, "  \n")}
         rows, _ = self.rows(spec_config(), outputs)
         self.assertEqual(rows[-1].reason, "command printed nothing")
+
+    def test_optional_regex_group_that_matches_nothing(self):
+        config = {"check": [check(rule="not_newer", pinned="1.0", version_regex=r"v=(\d+\.\d+)?")]}
+        rows, _ = self.rows(config, {("c", "thing", "--version"): (0, "no version\n")})
+        self.assertEqual(rows, [dg.Row("Thing", "-", "1.0", "CHECK",
+                                       "version not found in output: no version")])
 
     def test_unparseable_regex_capture(self):
         config = {"check": [check(rule="not_newer", pinned="1.0", version_regex=r"version=(\w+)")]}
