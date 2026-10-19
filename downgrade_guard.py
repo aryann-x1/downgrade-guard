@@ -477,7 +477,16 @@ def _snippet(output, limit=80):
     """First non-empty line of output, shortened for the table."""
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     text = lines[0] if lines else "no output"
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+    if len(text) <= limit:
+        return text
+    # Keep both ends: error chains (kubectl, docker) put the cause last.
+    head = text[: limit // 3].rsplit(" ", 1)[0]
+    tail = text[-(limit - len(head) - 5):]
+    if ": " in tail[: len(tail) // 2]:  # start at a nearby segment boundary...
+        tail = tail[tail.index(": ") + 2:]
+    elif " " in tail:                    # ...or at least at a word
+        tail = tail[tail.index(" ") + 1:]
+    return f"{head} ... {tail}"
 
 
 def _kubectl(config):

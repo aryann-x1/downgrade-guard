@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Long error messages in the RESULT column keep their start and their end, instead of being cut
+  off after 80 characters. Error chains from kubectl and docker put the cause last
+  (`exec: "psql": executable file not found in $PATH`), so it was the useful part that got lost.
+
 ## 0.2.0
 
 - `pinned_from`: read a check's pin from a Dockerfile (`FROM`, with global `ARG` defaults), a

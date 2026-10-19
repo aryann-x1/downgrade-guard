@@ -537,6 +537,29 @@ def run_main(config_text, execs, containers=None, extra_args=()):
     return code, out.getvalue(), err.getvalue()
 
 
+class SnippetTest(unittest.TestCase):
+    def test_short_output_is_unchanged(self):
+        self.assertEqual(dg._snippet("\n  psql: not found  \nmore\n"), "psql: not found")
+        self.assertEqual(dg._snippet(""), "no output")
+
+    def test_long_error_chain_keeps_the_cause(self):
+        kubectl = ('error: Internal error occurred: Internal error occurred: error executing '
+                   'command in container: failed to exec in container: failed to start exec '
+                   '"04b5eeecf9b3": OCI runtime exec failed: exec failed: unable to start '
+                   'container process: exec: "psql": executable file not found in $PATH')
+        self.assertEqual(dg._snippet(kubectl),
+                         'error: Internal error ... exec: "psql": executable file not found in $PATH')
+
+    def test_long_lines_stay_within_limit(self):
+        for text in ["x" * 200, "word " * 40, "a: " * 60,
+                     'psql: error: connection to server on socket "/var/run/postgresql/'
+                     '.s.PGSQL.5432" failed: No such file or directory']:
+            with self.subTest(text=text[:20]):
+                snippet = dg._snippet(text)
+                self.assertLessEqual(len(snippet), 80)
+                self.assertIn(" ... ", snippet)
+
+
 class MainTest(unittest.TestCase):
     def test_stop(self):
         code, out, _ = run_main(SPEC_CONFIG, SPEC_OUTPUTS)
